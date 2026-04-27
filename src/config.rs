@@ -35,7 +35,7 @@ pub enum Generator {
         location: String,
     },
     Aks {
-        name: String,
+        subscription: String,
         #[serde(rename = "resource-group")]
         resource_group: String,
     },

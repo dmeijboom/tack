@@ -64,16 +64,18 @@ fn generate(
             .env("KUBECONFIG", file.path())
             .spawn()?,
         Generator::Aks {
-            name,
+            subscription,
             resource_group,
         } => Command::new("az")
             .arg("aks")
             .arg("get-credentials")
+            .arg("--subscription")
+            .arg(subscription)
             .arg("--name")
             .arg(name)
             .arg("--resource-group")
             .arg(resource_group)
-            .arg(name)
+            .env("KUBECONFIG", file.path())
             .spawn()?,
     };
 
