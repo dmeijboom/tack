@@ -39,6 +39,9 @@ pub enum Generator {
         #[serde(rename = "resource-group")]
         resource_group: String,
     },
+    Tcloud {
+        organisation: String,
+    },
 }
 
 pub fn load_config(filename: impl AsRef<Path>) -> Result<Config, ConfigError> {

@@ -1,4 +1,9 @@
-use std::{error::Error, io::Read, path::Path, process::Command};
+use std::{
+    error::Error,
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use clap::Parser;
 use k8s_openapi::api::core::v1::Namespace;
@@ -51,49 +56,80 @@ fn generate(
     generator: &config::Generator,
 ) -> Result<(), Box<dyn Error>> {
     let file = NamedTempFile::new()?;
-    let mut child = match generator {
-        Generator::Gcloud { project, location } => Command::new("gcloud")
-            .arg("container")
-            .arg("clusters")
-            .arg("get-credentials")
-            .arg("--location")
-            .arg(location)
-            .arg("--project")
-            .arg(project)
-            .arg(name)
-            .env("KUBECONFIG", file.path())
-            .spawn()?,
+    let (mut child, writes_to_file) = match generator {
+        Generator::Gcloud { project, location } => (
+            Command::new("gcloud")
+                .arg("container")
+                .arg("clusters")
+                .arg("get-credentials")
+                .arg("--location")
+                .arg(location)
+                .arg("--project")
+                .arg(project)
+                .arg(name)
+                .env("KUBECONFIG", file.path())
+                .spawn()?,
+            true,
+        ),
         Generator::Aks {
             subscription,
             resource_group,
-        } => Command::new("az")
-            .arg("aks")
-            .arg("get-credentials")
-            .arg("--subscription")
-            .arg(subscription)
-            .arg("--name")
-            .arg(name)
-            .arg("--resource-group")
-            .arg(resource_group)
-            .env("KUBECONFIG", file.path())
-            .spawn()?,
+        } => (
+            Command::new("az")
+                .arg("aks")
+                .arg("get-credentials")
+                .arg("--subscription")
+                .arg(subscription)
+                .arg("--name")
+                .arg(name)
+                .arg("--resource-group")
+                .arg(resource_group)
+                .env("KUBECONFIG", file.path())
+                .spawn()?,
+            true,
+        ),
+        Generator::Tcloud { organisation } => (
+            Command::new("tcloud")
+                .stdout(Stdio::piped())
+                .arg("--organisation")
+                .arg(organisation)
+                .arg("kubernetes")
+                .arg("kubeconfig")
+                .arg(name)
+                .spawn()?,
+            false,
+        ),
     };
 
-    let status = child.wait()?;
+    if writes_to_file {
+        let status = child.wait()?;
 
-    if !status.success() {
-        return Err(format!(
-            "generator failed with exit code: {}",
-            status.code().unwrap_or_default()
-        )
-        .into());
+        if !status.success() {
+            return Err(format!(
+                "generator failed with exit code: {}",
+                status.code().unwrap_or_default()
+            )
+            .into());
+        }
+
+        let mut file = file.into_file();
+        let mut buff = vec![];
+
+        file.read_to_end(&mut buff)?;
+        store.store(name, buff)?;
+    } else {
+        let output = child.wait_with_output()?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "generator failed with exit code: {}",
+                output.status.code().unwrap_or_default()
+            )
+            .into());
+        }
+
+        store.store(name, output.stdout)?;
     }
-
-    let mut file = file.into_file();
-    let mut buff = vec![];
-
-    file.read_to_end(&mut buff)?;
-    store.store(name, buff)?;
 
     Ok(())
 }
@@ -148,15 +184,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut config = Kubeconfig::from_env()?.ok_or("unable to load kubeconfig")?;
 
             if let Some(name) = &config.current_context
-                && let Some(named_ctx) = config.contexts.iter_mut().find(|ctx| &ctx.name == name) {
-                    if named_ctx.context.is_none() {
-                        named_ctx.context = Some(Context::default());
-                    }
-
-                    if let Some(context) = named_ctx.context.as_mut() {
-                        context.namespace = Some(namespace);
-                    }
+                && let Some(named_ctx) = config.contexts.iter_mut().find(|ctx| &ctx.name == name)
+            {
+                if named_ctx.context.is_none() {
+                    named_ctx.context = Some(Context::default());
                 }
+
+                if let Some(context) = named_ctx.context.as_mut() {
+                    context.namespace = Some(namespace);
+                }
+            }
 
             let path = std::env::var("KUBECONFIG")?;
 
@@ -175,12 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Cmd::Use { name } => {
             let name = match name {
                 Some(name) => name,
-                None => pick_item(
-                    config
-                        .context
-                        .keys().cloned()
-                        .collect::<Vec<_>>(),
-                )?,
+                None => pick_item(config.context.keys().cloned().collect::<Vec<_>>())?,
             };
 
             let ctx = config.context.get(&name).ok_or("non-existing context")?;

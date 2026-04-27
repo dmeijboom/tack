@@ -7,7 +7,7 @@ pub struct Store {
 fn sanitize_name(name: &str) -> Option<&str> {
     if name
         .chars()
-        .any(|c| !matches!(c, 'a'..'z' | 'A'..'Z' | '-' | '_' | '0'..'9'))
+        .any(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '-' | '_' | '0'..='9'))
     {
         return None;
     }
