@@ -13,4 +13,5 @@ skim = "4.6.0"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["macros"] }
+dirs = "6.0.0"
 toml = "1.1.2"

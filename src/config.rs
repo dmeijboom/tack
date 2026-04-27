@@ -50,7 +50,7 @@ pub fn load_config(filename: impl AsRef<Path>) -> Result<Config, ConfigError> {
 }
 
 pub fn load_default_config() -> Result<Config, ConfigError> {
-    if let Some(home) = std::env::home_dir() {
+    if let Some(home) = dirs::home_dir() {
         let path = home.join(".config").join("tack").join("config.toml");
 
         if path.exists() {

@@ -1,4 +1,20 @@
-use std::path::PathBuf;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+
+pub fn write_restricted(path: impl AsRef<Path>, content: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(content)?;
+    Ok(())
+}
 
 pub struct Store {
     root: PathBuf,
@@ -30,12 +46,14 @@ impl Store {
             .unwrap_or(false)
     }
 
-    pub fn store(&self, name: &str, content: impl AsRef<[u8]>) -> Result<bool, std::io::Error> {
-        if let Some(name) = sanitize_name(name) {
-            std::fs::write(self.root.join(format!("{name}.yml")), content)?;
-            return Ok(true);
-        }
+    pub fn store(&self, name: &str, content: impl AsRef<[u8]>) -> Result<(), std::io::Error> {
+        let name = sanitize_name(name).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid context name")
+        })?;
 
-        Ok(false)
+        fs::create_dir_all(&self.root)?;
+
+        let path = self.root.join(format!("{name}.yml"));
+        write_restricted(path, content.as_ref())
     }
 }

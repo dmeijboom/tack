@@ -44,10 +44,10 @@ fn pick_item(items: Vec<String>) -> Result<String, Box<dyn Error>> {
         return Err("no item chosen".into());
     }
 
-    Ok(output
+    output
         .current
         .map(|cur| cur.item.to_string())
-        .unwrap_or_default())
+        .ok_or_else(|| "no item selected".into())
 }
 
 fn generate(
@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let kubeconfig_dir = config
         .kubeconfig_dir
         .take()
-        .or_else(|| std::env::home_dir().map(|home| home.join(".config").join("tack")))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config").join("tack")))
         .ok_or("unable to determine kubeconfig dir")?;
     let store = store::Store::new(kubeconfig_dir);
 
@@ -195,18 +195,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            let path = std::env::var("KUBECONFIG")?;
+            let path = std::env::var("KUBECONFIG")
+                .map_err(|_| "KUBECONFIG is not set, use `tack use` first")?;
 
-            // If we are already in a tmp shell we can just override the file
+            let yaml = serde_yaml::to_string(&config)?;
+
             if path.ends_with(".tmp.yml") {
-                std::fs::write(path, serde_yaml::to_string(&config)?)?;
+                store::write_restricted(&path, yaml.as_bytes())?;
             } else {
                 let file = NamedTempFile::with_suffix(".tmp.yml")?;
-                std::fs::write(file.path(), serde_yaml::to_string(&config)?)?;
+                store::write_restricted(file.path(), yaml.as_bytes())?;
                 let (_, path) = file.keep()?;
 
-                spawn_shell(&path)?;
-                std::fs::remove_file(path)?;
+                let result = spawn_shell(&path);
+                let _ = std::fs::remove_file(&path);
+                result?;
             }
         }
         Cmd::Use { name } => {
