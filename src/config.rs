@@ -19,6 +19,7 @@ pub struct Config {
     #[serde(default)]
     pub context: HashMap<String, Context>,
     pub kubeconfig_dir: Option<PathBuf>,
+    pub shell: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -34,12 +34,16 @@ tack namespace kube-system  # directly by name
 Configuration lives at `~/.config/tack/config.toml`. Generated kubeconfigs are stored as YAML files in `~/.config/tack/`.
 
 You can override the kubeconfig storage directory with the `kubeconfig_dir` option.
+You can also set `shell` to choose which shell tack spawns. When omitted, tack falls back to `$SHELL`, then `/bin/sh`.
 
 ### Example
 
 ```toml
 # Optional: override where generated kubeconfigs are stored
 # kubeconfig_dir = "/home/user/.config/tack"
+
+# Optional: override which shell `tack use` and `tack namespace` spawn
+# shell = "/bin/zsh"
 
 # GKE cluster via gcloud
 [context.production-gke]

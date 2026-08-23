@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    ffi::OsString,
     io::Read,
     path::Path,
     process::{Command, Stdio},
@@ -134,10 +135,13 @@ fn generate(
     Ok(())
 }
 
-fn spawn_shell(kubeconfig: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+fn spawn_shell(kubeconfig: impl AsRef<Path>, shell: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    let shell = shell
+        .map(|shell| shell.as_os_str().to_os_string())
+        .or_else(|| std::env::var_os("SHELL"))
+        .unwrap_or_else(|| OsString::from("/bin/sh"));
 
-    Command::new(shell)
+    Command::new(&shell)
         .env("KUBECONFIG", kubeconfig.as_ref())
         .env("TACK_ENABLED", "1")
         .spawn()?
@@ -150,6 +154,7 @@ fn spawn_shell(kubeconfig: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let opts = Opts::parse();
     let mut config = config::load_default_config()?;
+    let shell = config.shell.clone();
     let kubeconfig_dir = config
         .kubeconfig_dir
         .take()
@@ -207,7 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 store::write_restricted(file.path(), yaml.as_bytes())?;
                 let (_, path) = file.keep()?;
 
-                let result = spawn_shell(&path);
+                let result = spawn_shell(&path, shell.as_deref());
                 let _ = std::fs::remove_file(&path);
                 result?;
             }
@@ -234,7 +239,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .kubeconfig(&name)
                 .ok_or("unable to determine kubeconfig")?;
 
-            spawn_shell(kubeconfig)?;
+            spawn_shell(kubeconfig, shell.as_deref())?;
         }
     }
 
