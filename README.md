@@ -33,6 +33,64 @@ tack namespace          # or: tack ns (interactive fuzzy picker)
 tack namespace kube-system  # directly by name
 ```
 
+## Diagnostics
+
+Human-readable failures are rendered by `miette` on stderr, with an error code, cause chain, and actionable help. Invalid TOML includes a highlighted source location. Color is detected automatically; set `NO_COLOR=1` to disable it. Failed subprocesses identify the executable and arguments without dumping their environment or credential-plugin stdout.
+
+Exit status is `0` on success, `1` for runtime failures, `2` for invalid arguments, and `130` for cancelled interactive selection. A spawned shell's nonzero exit status is propagated.
+
+## JSON / LLM automation
+
+`--json` is global and may appear before or after a subcommand. It emits exactly one JSON object on stdout, including for errors, help, and version output. Progress and successful child-process output are suppressed. Errors still return a nonzero exit status.
+
+JSON mode never opens a shell, fuzzy picker, or interactive cloud login. It may still contact Kubernetes and generate/regenerate cached kubeconfigs. When login is needed, it returns `auth_required` with a command represented as an executable plus an argument array; run that command interactively, then retry.
+
+| Command | `data.kind` | Result |
+| --- | --- | --- |
+| `tack --json list` | `contexts` | Sorted configured context names |
+| `tack --json use` | `contexts` | Context choices instead of a picker |
+| `tack --json use <context>` | `environment` | Validated kubeconfig path, namespace, and environment overrides; no shell |
+| `tack --json namespace` | `namespaces` | Sorted accessible namespaces and the current namespace; requires `KUBECONFIG` |
+| `tack --json namespace <namespace>` | `environment` | A separate namespace-scoped kubeconfig and environment overrides; no shell |
+| `tack --json --help` | `help` | Plain help text |
+| `tack --json --version` | `version` | Version string |
+
+Success:
+
+```json
+{"schema_version":1,"ok":true,"data":{"kind":"contexts","contexts":["production-gke","staging-aks"]}}
+```
+
+Failure:
+
+```json
+{
+  "schema_version": 1,
+  "ok": false,
+  "error": {
+    "code": "auth_required",
+    "message": "Cloud authentication requires interactive login",
+    "help": "Authenticate in a terminal, then retry.",
+    "causes": ["Kubernetes credential plugin failed"],
+    "path": "/home/user/.config/tack/staging-aks.yml",
+    "command": {
+      "program": "az",
+      "args": ["login", "--subscription", "subscription-id", "--tenant", "tenant-id", "--scope", "resource/.default"]
+    },
+    "status": null,
+    "http_status": null,
+    "exit_code": 1,
+    "span": null
+  }
+}
+```
+
+Branch on `error.code`, not the human-readable message. Codes include `config_not_found`, `config_invalid`, `context_not_found`, `context_required`, `kubeconfig_missing`, `auth_required`, `auth_failed`, `access_denied`, `kubernetes_failed`, and `command_failed`. Optional error metadata is `null` when unavailable. `status` is a subprocess exit status; `http_status` is a Kubernetes HTTP status. TOML `span` offsets and lengths are in bytes.
+
+An `environment` result contains `context`, `namespace`, `kubeconfig`, `env`, and `cleanup`. Pass `data.env` as environment overrides to subsequent commands; do not evaluate it as shell code. No tokens, certificates, or kubeconfig contents are returned. Use the returned `KUBECONFIG` and `TACK_CONTEXT` for subsequent namespace operations.
+
+For namespace selection, `cleanup` lists the private temporary kubeconfig to delete when finished. JSON mode retains this file after tack exits and does not modify the input kubeconfig's namespace. Cached context kubeconfigs have an empty cleanup list and should not be deleted.
+
 ## Configuration
 
 Configuration lives at `~/.config/tack/config.toml`. Generated kubeconfigs are stored as YAML files in `~/.config/tack/`.

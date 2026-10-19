@@ -4,15 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("failed to load config: {0}")]
-    IO(#[from] std::io::Error),
-    #[error("failed to parse config: {0}")]
-    Toml(#[from] toml::de::Error),
-    #[error("config not found")]
-    Missing,
-}
+use crate::error::{AppError, Result};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -48,21 +40,34 @@ pub enum Generator {
     },
 }
 
-pub fn load_config(filename: impl AsRef<Path>) -> Result<Config, ConfigError> {
-    let content = std::fs::read(filename)?;
-    Ok(toml::from_slice(&content)?)
+pub fn load_config(filename: impl AsRef<Path>) -> Result<Config> {
+    let path = filename.as_ref();
+    let content = std::fs::read_to_string(path).map_err(|source| {
+        let code = if source.kind() == std::io::ErrorKind::NotFound {
+            "config_not_found"
+        } else {
+            "config_read_failed"
+        };
+        AppError::io(code, "Unable to read tack configuration", path, source).help(
+            "Create or fix ~/.config/tack/config.toml; see the README for configuration examples.",
+        )
+    })?;
+    toml::from_str(&content).map_err(|source: toml::de::Error| {
+        let span = source.span();
+        AppError::new("config_invalid", "Invalid tack configuration")
+            .at_path(path)
+            .help("Correct the highlighted TOML or context settings and retry.")
+            .detail(source.message())
+            .with_source_code(path, content, span)
+    })
 }
 
-pub fn load_default_config() -> Result<Config, ConfigError> {
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".config").join("tack").join("config.toml");
-
-        if path.exists() {
-            return load_config(path);
-        }
-    }
-
-    Err(ConfigError::Missing)
+pub fn load_default_config() -> Result<Config> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        AppError::new("home_unavailable", "Unable to determine the home directory")
+            .help("Set HOME so tack can locate ~/.config/tack/config.toml.")
+    })?;
+    load_config(home.join(".config").join("tack").join("config.toml"))
 }
 
 #[cfg(test)]

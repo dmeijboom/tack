@@ -13,7 +13,12 @@ use kube::{
 };
 use tempfile::NamedTempFile;
 
-use crate::{config::Generator, store};
+use crate::{
+    config::Generator,
+    error::{AppError, Result as AppResult},
+    output::Mode,
+    store,
+};
 
 #[derive(Debug, PartialEq)]
 enum Action {
@@ -57,12 +62,18 @@ fn argument_value(args: &[&str], flag: &str) -> Option<String> {
     })
 }
 
-fn prepare_client_config(config: &mut Kubeconfig, generator: Option<&Generator>) -> AzureLogin {
+fn prepare_client_config(
+    config: &mut Kubeconfig,
+    generator: Option<&Generator>,
+    mode: Mode,
+) -> AzureLogin {
     let mut azure = AzureLogin::default();
-    if !matches!(
-        generator,
-        Some(Generator::Aks { .. } | Generator::Gcloud { .. })
-    ) {
+    if !mode.is_json()
+        && !matches!(
+            generator,
+            Some(Generator::Aks { .. } | Generator::Gcloud { .. })
+        )
+    {
         return azure;
     }
     let user = config
@@ -103,6 +114,7 @@ pub struct Recovery<'a> {
     regenerated: bool,
     logged_in: bool,
     azure_login: AzureLogin,
+    mode: Mode,
 }
 
 impl<'a> Recovery<'a> {
@@ -111,6 +123,7 @@ impl<'a> Recovery<'a> {
         name: Option<&'a str>,
         generator: Option<&'a Generator>,
         kubeconfig: &'a Path,
+        mode: Mode,
     ) -> Self {
         Self {
             store,
@@ -120,10 +133,23 @@ impl<'a> Recovery<'a> {
             regenerated: false,
             logged_in: false,
             azure_login: AzureLogin::default(),
+            mode,
         }
     }
 
     fn action(&mut self, error: &(dyn Error + 'static)) -> Option<Action> {
+        if let Some(error) = error.downcast_ref::<AppError>()
+            && !matches!(
+                error.code,
+                "command_failed"
+                    | "auth_failed"
+                    | "auth_required"
+                    | "access_denied"
+                    | "kubernetes_failed"
+            )
+        {
+            return None;
+        }
         let generator = self.generator?;
         self.name?;
         let mut message = String::new();
@@ -139,6 +165,9 @@ impl<'a> Recovery<'a> {
                 message.push('\n');
             }
             if let Some(kube::Error::Api(status)) = error.downcast_ref::<kube::Error>() {
+                denied |= matches!(status.code, 401 | 403);
+            }
+            if let Some(status) = error.downcast_ref::<kube::core::Status>() {
                 denied |= matches!(status.code, 401 | 403);
             }
             source = error.source();
@@ -183,33 +212,53 @@ impl<'a> Recovery<'a> {
         None
     }
 
-    fn login(&self) -> Result<(), Box<dyn Error>> {
-        let generator = self.generator.ok_or("no generator configured")?;
-        let mut command =
-            login_command(generator, &self.azure_login).ok_or("generator has no login command")?;
-        eprintln!("# authentication required; running {command:?} in the console");
+    fn login(&self, cause: AppError) -> AppResult<()> {
+        let mut command = self
+            .generator
+            .and_then(|generator| login_command(generator, &self.azure_login))
+            .ok_or_else(|| AppError::auth_required(None))?;
+        if self.mode.is_json() {
+            return Err(AppError::auth_required(Some(&command))
+                .at_path(self.kubeconfig)
+                .caused_by(cause));
+        }
+        self.mode.progress(format_args!(
+            "# authentication required; running {command:?} in the console"
+        ));
         let status = command
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .map_err(|error| format!("unable to run {command:?}: {error}"))?;
+            .map_err(|source| AppError::command_start(&command, source))?;
         if !status.success() {
-            return Err(format!("cloud login command {command:?} failed: {status}").into());
+            return Err(AppError::command_failed(&command, status, String::new())
+                .help("Complete cloud authentication successfully, then retry."));
         }
         Ok(())
     }
 
-    pub fn generate(&mut self) -> Result<(), Box<dyn Error>> {
-        let name = self.name.ok_or("unable to determine tack context")?;
-        let generator = self.generator.ok_or("no generator configured")?;
+    pub fn generate(&mut self) -> AppResult<()> {
+        let name = self.name.ok_or_else(|| {
+            AppError::new("context_required", "Unable to determine the tack context")
+                .help("Select a context with `tack use <context>` first.")
+        })?;
+        let generator = self.generator.ok_or_else(|| {
+            AppError::new(
+                "generator_missing",
+                format!("No generator configured for {name}"),
+            )
+            .help("Configure a generator or provide a kubeconfig in tack's store.")
+        })?;
         loop {
-            match generate_once(self.store, name, generator) {
+            match generate_once(self.store, name, generator, self.mode) {
                 Ok(()) => return Ok(()),
-                Err(error) => match self.action(error.as_ref()) {
-                    Some(Action::Login) => self.login()?,
+                Err(error) => match self.action(&error) {
+                    Some(Action::Login) => self.login(error)?,
                     Some(Action::Regenerate) => {
-                        eprintln!("# access denied; regenerating kubeconfig for {name} once");
+                        self.mode.progress(format_args!(
+                            "# access denied; regenerating kubeconfig for {name} once"
+                        ));
                     }
                     None => return Err(error),
                 },
@@ -217,16 +266,21 @@ impl<'a> Recovery<'a> {
         }
     }
 
-    fn regenerate(&mut self) -> Result<(), Box<dyn Error>> {
-        let previous = Kubeconfig::read_from(self.kubeconfig)?;
+    fn regenerate(&mut self) -> AppResult<()> {
+        let previous = Kubeconfig::read_from(self.kubeconfig)
+            .map_err(|source| AppError::kubeconfig(self.kubeconfig, source))?;
         let namespace = current_namespace(&previous);
-        eprintln!("# access denied; regenerating kubeconfig once");
+        self.mode
+            .progress("# access denied; regenerating kubeconfig once");
         self.generate()?;
         let source = self
             .name
             .and_then(|name| self.store.kubeconfig(name))
-            .ok_or("unable to determine kubeconfig")?;
-        let mut config = Kubeconfig::read_from(source)?;
+            .ok_or_else(|| {
+                AppError::new("context_invalid", "Unable to determine kubeconfig path")
+            })?;
+        let mut config =
+            Kubeconfig::read_from(&source).map_err(|error| AppError::kubeconfig(&source, error))?;
         if let Some(context) = config
             .contexts
             .iter_mut()
@@ -235,11 +289,25 @@ impl<'a> Recovery<'a> {
         {
             context.namespace = namespace;
         }
-        store::write_restricted(self.kubeconfig, serde_yaml::to_string(&config)?.as_bytes())?;
+        let yaml = serde_yaml::to_string(&config).map_err(|source| {
+            AppError::new(
+                "kubeconfig_invalid",
+                "Unable to serialize regenerated kubeconfig",
+            )
+            .caused_by(source)
+        })?;
+        store::write_restricted(self.kubeconfig, yaml.as_bytes()).map_err(|source| {
+            AppError::io(
+                "kubeconfig_write_failed",
+                "Unable to save regenerated kubeconfig",
+                self.kubeconfig,
+                source,
+            )
+        })?;
         Ok(())
     }
 
-    pub async fn check_access(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn check_access(&mut self) -> AppResult<()> {
         self.with_client(|client| async move {
             let review = Api::<SelfSubjectReview>::all(client.clone())
                 .create(&PostParams::default(), &SelfSubjectReview::default())
@@ -252,25 +320,31 @@ impl<'a> Recovery<'a> {
         .await
     }
 
-    pub async fn with_client<T, F, Fut>(&mut self, mut operation: F) -> Result<T, Box<dyn Error>>
+    pub async fn with_client<T, F, Fut>(&mut self, mut operation: F) -> AppResult<T>
     where
         F: FnMut(Client) -> Fut,
         Fut: Future<Output = Result<T, kube::Error>>,
     {
         loop {
             let result = async {
-                let mut kubeconfig = Kubeconfig::read_from(self.kubeconfig)?;
-                self.azure_login = prepare_client_config(&mut kubeconfig, self.generator);
-                let config =
-                    kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default()).await?;
-                let client = Client::try_from(config)?;
-                Ok::<_, Box<dyn Error>>(operation(client).await?)
+                let mut kubeconfig = Kubeconfig::read_from(self.kubeconfig)
+                    .map_err(|source| AppError::kubeconfig(self.kubeconfig, source))?;
+                self.azure_login =
+                    prepare_client_config(&mut kubeconfig, self.generator, self.mode);
+                let config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
+                    .await
+                    .map_err(|source| AppError::kubeconfig(self.kubeconfig, source))?;
+                let client = Client::try_from(config)
+                    .map_err(|source| AppError::kubernetes(source).at_path(self.kubeconfig))?;
+                operation(client)
+                    .await
+                    .map_err(|source| AppError::kubernetes(source).at_path(self.kubeconfig))
             }
             .await;
             match result {
                 Ok(value) => return Ok(value),
-                Err(error) => match self.action(error.as_ref()) {
-                    Some(Action::Login) => self.login()?,
+                Err(error) => match self.action(&error) {
+                    Some(Action::Login) => self.login(error)?,
                     Some(Action::Regenerate) => self.regenerate()?,
                     None => return Err(error),
                 },
@@ -433,38 +507,69 @@ fn generate_once(
     store: &store::Store,
     name: &str,
     generator: &Generator,
-) -> Result<(), Box<dyn Error>> {
-    let file = NamedTempFile::new()?;
+    mode: Mode,
+) -> AppResult<()> {
+    let file = NamedTempFile::new().map_err(|source| {
+        AppError::new(
+            "temporary_file_failed",
+            "Unable to create a temporary kubeconfig",
+        )
+        .help("Check that the temporary directory exists and is writable.")
+        .caused_by(source)
+    })?;
     let (mut command, stdout_config) = generator_command(generator, name, file.path());
     let output = command
+        .stdin(Stdio::null())
         .output()
-        .map_err(|error| format!("unable to run {command:?}: {error}"))?;
+        .map_err(|source| AppError::command_start(&command, source))?;
     if !output.status.success() {
         let stdout = if stdout_config {
             String::new()
         } else {
             String::from_utf8_lossy(&output.stdout).into_owned()
         };
-        return Err(format!(
-            "generator command {command:?} failed ({}): {}{}",
+        return Err(AppError::command_failed(
+            &command,
             output.status,
-            stdout,
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+            format!("{}{}", stdout, String::from_utf8_lossy(&output.stderr)),
+        ));
     }
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    mode.child_output(&output.stderr);
+    if !stdout_config {
+        mode.child_output(&output.stdout);
+    }
     let content = if stdout_config {
         output.stdout
     } else {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        std::fs::read(file.path())?
+        std::fs::read(file.path()).map_err(|source| {
+            AppError::io(
+                "kubeconfig_read_failed",
+                "Unable to read generated kubeconfig",
+                file.path(),
+                source,
+            )
+        })?
     };
     if content.is_empty() {
-        return Err("generator returned an empty kubeconfig".into());
+        return Err(AppError::new(
+            "kubeconfig_invalid",
+            "Generator returned an empty kubeconfig",
+        )
+        .with_command(&command));
     }
-    Kubeconfig::from_yaml(&String::from_utf8_lossy(&content))?;
-    store.store(name, content)?;
+    Kubeconfig::from_yaml(&String::from_utf8_lossy(&content))
+        .map_err(|source| AppError::kubeconfig(file.path(), source))?;
+    let path = store.kubeconfig(name).ok_or_else(|| {
+        AppError::new("context_invalid", format!("Invalid context name {name:?}"))
+    })?;
+    store.store(name, content).map_err(|source| {
+        AppError::io(
+            "kubeconfig_write_failed",
+            "Unable to store generated kubeconfig",
+            &path,
+            source,
+        )
+    })?;
     Ok(())
 }
 
@@ -522,7 +627,7 @@ users:
     fn cloud_checks_capture_stderr_without_changing_stored_exec_settings() {
         let original = azure_kubeconfig();
         let mut prepared = original.clone();
-        let settings = prepare_client_config(&mut prepared, Some(&aks()));
+        let settings = prepare_client_config(&mut prepared, Some(&aks()), Mode::Human);
         assert_eq!(settings.tenant.as_deref(), Some("kube-tenant"));
         assert_eq!(settings.scope.as_deref(), Some("kube-server/.default"));
         assert_eq!(
@@ -548,7 +653,7 @@ users:
             Some(ExecInteractiveMode::IfAvailable)
         );
         let mut unmanaged = original.clone();
-        prepare_client_config(&mut unmanaged, None);
+        prepare_client_config(&mut unmanaged, None, Mode::Human);
         assert_eq!(
             serde_yaml::to_string(&unmanaged).unwrap(),
             serde_yaml::to_string(&original).unwrap()
@@ -562,7 +667,7 @@ users:
             *tenant = None;
         }
         let mut kubeconfig = azure_kubeconfig();
-        let settings = prepare_client_config(&mut kubeconfig, Some(&generator));
+        let settings = prepare_client_config(&mut kubeconfig, Some(&generator), Mode::Human);
         let exec = kubeconfig.auth_infos[0]
             .auth_info
             .as_mut()
@@ -585,6 +690,7 @@ users:
             Some("cluster"),
             Some(&generator),
             Path::new("unused"),
+            Mode::Human,
         );
         recovery.azure_login = settings;
         assert_eq!(recovery.action(&error), Some(Action::Login));
@@ -671,6 +777,7 @@ users:
                     Some("cluster"),
                     Some(&generator),
                     Path::new("unused"),
+                    Mode::Human,
                 );
                 assert_eq!(recovery.action(&error), Some(Action::Regenerate));
                 assert_eq!(recovery.action(&error), None);
@@ -723,6 +830,7 @@ users:
             Some("cluster"),
             Some(&generator),
             Path::new("unused"),
+            Mode::Human,
         );
         let login = std::io::Error::other("Forbidden: run gcloud auth login");
         let denied = std::io::Error::other("ACCESS DENIED");
@@ -751,6 +859,7 @@ users:
                 Some("cluster"),
                 Some(&generator),
                 Path::new("unused"),
+                Mode::Human,
             );
             assert_eq!(
                 recovery.action(&std::io::Error::other(message)),
@@ -763,6 +872,7 @@ users:
             Some("cluster"),
             Some(&generator),
             Path::new("unused"),
+            Mode::Human,
         );
         assert_eq!(
             recovery.action(&std::io::Error::other("connection refused")),
@@ -784,6 +894,7 @@ users:
                 Some("cluster"),
                 Some(&generator),
                 Path::new("unused"),
+                Mode::Human,
             );
             let error = kube::Error::Api(Box::new(kube::core::Status::default().with_code(code)));
             assert_eq!(recovery.action(&error), Some(Action::Regenerate));
@@ -793,6 +904,7 @@ users:
             Some("cluster"),
             Some(&generator),
             Path::new("unused"),
+            Mode::Human,
         );
         let error = kube::Error::Service(Box::new(kube::Error::Auth(
             kube::client::AuthError::AuthExecRun {
@@ -809,9 +921,75 @@ users:
     }
 
     #[test]
+    fn local_io_errors_do_not_trigger_cloud_recovery() {
+        let store = store::Store::new("unused".into());
+        let generator = aks();
+        let mut recovery = Recovery::new(
+            &store,
+            Some("cluster"),
+            Some(&generator),
+            Path::new("unused"),
+            Mode::Json,
+        );
+        for code in [
+            "kubeconfig_write_failed",
+            "command_not_found",
+            "temporary_file_failed",
+        ] {
+            let error = AppError::new(code, "Local operation failed").detail("Permission denied");
+            assert_eq!(recovery.action(&error), None);
+        }
+        assert!(!recovery.regenerated);
+        assert!(!recovery.logged_in);
+    }
+
+    #[test]
+    fn structured_api_errors_preserve_the_regeneration_signal() {
+        let store = store::Store::new("unused".into());
+        let generator = aks();
+        for code in [401, 403] {
+            let mut recovery = Recovery::new(
+                &store,
+                Some("cluster"),
+                Some(&generator),
+                Path::new("unused"),
+                Mode::Json,
+            );
+            let error = AppError::kubernetes(kube::Error::Api(
+                kube::core::Status::default().with_code(code).boxed(),
+            ));
+            assert_eq!(recovery.action(&error), Some(Action::Regenerate));
+            assert_eq!(recovery.action(&error), None);
+        }
+    }
+
+    #[test]
+    fn json_checks_make_unmanaged_exec_plugins_noninteractive() {
+        let mut config = azure_kubeconfig();
+        prepare_client_config(&mut config, None, Mode::Json);
+        assert_eq!(
+            config.auth_infos[0]
+                .auth_info
+                .as_ref()
+                .unwrap()
+                .exec
+                .as_ref()
+                .unwrap()
+                .interactive_mode,
+            Some(ExecInteractiveMode::Never)
+        );
+    }
+
+    #[test]
     fn does_not_recover_without_a_generator() {
         let store = store::Store::new("unused".into());
-        let mut recovery = Recovery::new(&store, Some("cluster"), None, Path::new("unused"));
+        let mut recovery = Recovery::new(
+            &store,
+            Some("cluster"),
+            None,
+            Path::new("unused"),
+            Mode::Human,
+        );
         assert_eq!(
             recovery.action(&std::io::Error::other("Forbidden: az login")),
             None
