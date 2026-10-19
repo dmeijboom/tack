@@ -4,7 +4,7 @@ A Kubernetes context and namespace switcher. An alternative to [kubie](https://g
 
 ## How it works
 
-Unlike tools that mutate your global `~/.kube/config`, tack spawns a **new sub-shell** with an isolated `KUBECONFIG` for each context. Exiting the shell returns you to your previous context. This means you can have multiple terminals connected to different clusters without conflicts.
+Unlike tools that mutate your global `~/.kube/config`, tack spawns a **new sub-shell** or runs a single command with an isolated `KUBECONFIG` for each context. Exiting the shell or command returns you to your previous context. This means you can have multiple terminals connected to different clusters without conflicts.
 
 When switching to a context for the first time, tack can automatically generate the kubeconfig using `gcloud`, `az`, or `tcloud` CLI tools.
 
@@ -28,6 +28,9 @@ tack list    # or: tack ls
 tack use             # interactive fuzzy picker
 tack use my-cluster  # directly by name
 
+# Run one command in a context without opening a shell or prompting for login
+tack --use my-cluster -- kubectl get pods --namespace kube-system
+
 # Switch namespace within a context
 tack namespace          # or: tack ns (interactive fuzzy picker)
 tack namespace kube-system  # directly by name
@@ -37,7 +40,13 @@ tack namespace kube-system  # directly by name
 
 Human-readable failures are rendered by `miette` on stderr, with an error code, cause chain, and actionable help. Invalid TOML includes a highlighted source location. Color is detected automatically; set `NO_COLOR=1` to disable it. Failed subprocesses identify the executable and arguments without dumping their environment or credential-plugin stdout.
 
-Exit status is `0` on success, `1` for runtime failures, `2` for invalid arguments, and `130` for cancelled interactive selection. A spawned shell's nonzero exit status is propagated.
+Exit status is `0` on success, `1` for runtime failures, `2` for invalid arguments, and `130` for cancelled interactive selection. A spawned shell or command's nonzero exit status is propagated.
+
+## One-shot commands
+
+`tack --use <context> -- <command> [args...]` validates access and runs the command directly with isolated `KUBECONFIG`, `TACK_CONTEXT`, and `TACK_ENABLED` overrides. The `--` separator and a command are required. Arguments after `--` are passed unchanged, without shell evaluation; stdout and stderr are inherited.
+
+Activation is non-interactive, using the same checks and credential recovery as JSON mode. If cloud login is needed, tack reports the error without launching login or the command. Authenticate in a terminal and retry. The child command runs once and is not intercepted or retried. This mode cannot be combined with `--json` or a tack subcommand.
 
 ## JSON / LLM automation
 
@@ -93,11 +102,11 @@ For namespace selection, `cleanup` lists the private temporary kubeconfig to del
 
 ## Agent Skill
 
-The portable [`tack` skill](.agents/skills/tack/SKILL.md) lets agents list contexts, activate a context or namespace using JSON environment overrides, and inspect Kubernetes with a strict read-only kubectl policy. It never uses interactive subshells or changes the global kubeconfig.
+The portable [`tack` skill](.agents/skills/tack/SKILL.md) lets agents validate a context once with `tack --json use <context>`, then inspect Kubernetes through `tack --use <context> -- kubectl ...` with a strict read-only policy. Namespaces are selected with kubectl's `--namespace` flag. Every command explicitly selects its tack context. It never uses interactive subshells or changes the global kubeconfig.
 
 Pi discovers it from `.agents/skills/tack/` in this repository; run `/reload` in an existing session, then use `/skill:tack`. To use it from other projects, copy that directory into your agent's user skills directory (for Pi, `~/.pi/agent/skills/tack/`). The skill requires the installed `tack` and `kubectl` executables, configured contexts, and any necessary cloud authentication.
 
-The skill prohibits Kubernetes writes, container execution, port forwarding, plugins, raw API requests, and credential overrides. This is an agent policy, **not an enforcement boundary**: use Kubernetes RBAC with read-only credentials to enforce resource and namespace restrictions. Activation can still refresh local kubeconfigs and credential caches and perform tack's non-persisted authentication review.
+The skill permits non-mutating kubectl diagnostics, including loopback-only port forwarding and proxying for read-only access. It prohibits Kubernetes and application writes, container execution, plugins, raw kubectl API requests, and credential overrides. This is an agent policy, **not an enforcement boundary**: use Kubernetes RBAC with read-only credentials to enforce resource and namespace restrictions. Activation can still refresh local kubeconfigs and credential caches and perform tack's non-persisted authentication review.
 
 ## Configuration
 

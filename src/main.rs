@@ -25,7 +25,11 @@ mod recovery;
 mod store;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Isolated Kubernetes contexts and namespaces")]
+#[command(
+    version,
+    about = "Isolated Kubernetes contexts and namespaces",
+    subcommand_negates_reqs = true
+)]
 struct Opts {
     #[arg(
         long,
@@ -33,8 +37,24 @@ struct Opts {
         help = "Emit one JSON result without prompts or shells"
     )]
     json: bool,
+    #[arg(
+        long = "use",
+        value_name = "CONTEXT",
+        required = true,
+        requires = "command",
+        conflicts_with = "json",
+        help = "Run a command in an isolated context without prompts or a shell"
+    )]
+    use_context: Option<String>,
+    #[arg(
+        last = true,
+        required = true,
+        value_name = "COMMAND",
+        requires = "use_context"
+    )]
+    command: Vec<OsString>,
     #[clap(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Debug, Parser)]
@@ -69,7 +89,15 @@ fn parse(args: Vec<OsString>) -> (Mode, Result<Invocation>) {
     });
     let result = match command.try_get_matches_from(args) {
         Ok(matches) => Opts::from_arg_matches(&matches)
-            .map(Invocation::Run)
+            .and_then(|opts| {
+                if opts.cmd.is_some() && (opts.use_context.is_some() || !opts.command.is_empty()) {
+                    return Err(clap::Error::raw(
+                        ErrorKind::ArgumentConflict,
+                        "--use and COMMAND cannot be combined with a subcommand",
+                    ));
+                }
+                Ok(Invocation::Run(opts))
+            })
             .map_err(output::invalid_arguments),
         Err(error) => match error.kind() {
             ErrorKind::DisplayHelp => Ok(Invocation::Display(Data::Help {
@@ -154,6 +182,29 @@ fn spawn_shell(kubeconfig: &Path, shell: Option<&Path>, context: Option<&str>) -
             .and_then(|code| u8::try_from(code).ok())
             .unwrap_or(1);
         return Err(error);
+    }
+    Ok(())
+}
+
+fn run_command(kubeconfig: &Path, context: &str, args: &[OsString]) -> Result<()> {
+    let (program, args) = args.split_first().ok_or_else(|| {
+        AppError::new("invalid_arguments", "A command is required after --").with_exit_code(2)
+    })?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env("KUBECONFIG", kubeconfig)
+        .env("TACK_CONTEXT", context)
+        .env("TACK_ENABLED", "1");
+    let status = command
+        .status()
+        .map_err(|source| AppError::command_start(&command, source))?;
+    if !status.success() {
+        let code = status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1);
+        return Err(AppError::command_failed(&command, status, String::new()).with_exit_code(code));
     }
     Ok(())
 }
@@ -249,13 +300,22 @@ fn temporary_kubeconfig(config: &Kubeconfig) -> Result<NamedTempFile> {
 }
 
 async fn run(opts: Opts) -> Result<Data> {
-    let mode = if opts.json { Mode::Json } else { Mode::Human };
+    let mode = if opts.json || opts.use_context.is_some() {
+        Mode::Json
+    } else {
+        Mode::Human
+    };
+    let cmd = match opts.use_context {
+        Some(name) => Cmd::Use { name: Some(name) },
+        None => opts.cmd.ok_or_else(|| {
+            AppError::new("invalid_arguments", "A subcommand or --use is required")
+                .with_exit_code(2)
+        })?,
+    };
     let mut config = config::load_default_config()?;
     let mut contexts = config.context.keys().cloned().collect::<Vec<_>>();
     contexts.sort();
-    if matches!(opts.cmd, Cmd::List)
-        || (mode.is_json() && matches!(opts.cmd, Cmd::Use { name: None }))
-    {
+    if matches!(cmd, Cmd::List) || (mode.is_json() && matches!(cmd, Cmd::Use { name: None })) {
         return Ok(Data::Contexts { contexts });
     }
     let shell = config.shell.clone();
@@ -270,7 +330,7 @@ async fn run(opts: Opts) -> Result<Data> {
             )
         })?;
     let store = store::Store::new(kubeconfig_dir);
-    match opts.cmd {
+    match cmd {
         Cmd::List => Ok(Data::Contexts { contexts }),
         Cmd::Use { name } => {
             let name = match name {
@@ -309,6 +369,10 @@ async fn run(opts: Opts) -> Result<Data> {
                 recovery.generate()?;
             }
             recovery.check_access().await?;
+            if !opts.command.is_empty() {
+                run_command(&kubeconfig, &name, &opts.command)?;
+                return Ok(Data::Completed);
+            }
             if mode.is_json() {
                 return environment(&kubeconfig, Some(&name), false);
             }
@@ -473,8 +537,113 @@ mod tests {
         let (mode, result) = parse(args(&["tack", "use", "--", "--json"]));
         assert_eq!(mode, Mode::Human);
         assert!(
-            matches!(result.unwrap(), Invocation::Run(Opts { cmd: Cmd::Use { name: Some(name) }, .. }) if name == "--json")
+            matches!(result.unwrap(), Invocation::Run(Opts { cmd: Some(Cmd::Use { name: Some(name) }), .. }) if name == "--json")
         );
+    }
+
+    #[test]
+    fn one_shot_commands_preserve_arguments_after_separator() {
+        let (mode, result) = parse(args(&[
+            "tack",
+            "--use",
+            "cluster",
+            "--",
+            "kubectl",
+            "get",
+            "pods",
+            "--namespace",
+            "kube-system",
+            "--json",
+            "a; echo unexpected",
+        ]));
+        assert_eq!(mode, Mode::Human);
+        let Invocation::Run(opts) = result.unwrap() else {
+            panic!("expected command invocation");
+        };
+        assert_eq!(opts.use_context.as_deref(), Some("cluster"));
+        assert!(opts.cmd.is_none());
+        assert_eq!(
+            opts.command,
+            args(&[
+                "kubectl",
+                "get",
+                "pods",
+                "--namespace",
+                "kube-system",
+                "--json",
+                "a; echo unexpected",
+            ])
+        );
+    }
+
+    #[test]
+    fn one_shot_commands_require_a_context_separator_and_command() {
+        for argv in [
+            vec!["tack"],
+            vec!["tack", "--use", "cluster"],
+            vec!["tack", "--use", "cluster", "--"],
+            vec!["tack", "--use", "cluster", "kubectl", "get", "pods"],
+            vec!["tack", "--", "kubectl", "get", "pods"],
+            vec!["tack", "--json", "--use", "cluster", "--", "kubectl"],
+            vec!["tack", "--use", "cluster", "list"],
+            vec!["tack", "--use", "cluster", "use", "other"],
+        ] {
+            let (_, result) = parse(args(&argv));
+            let error = result.err().unwrap();
+            assert_eq!(error.code, "invalid_arguments", "{argv:?}");
+            assert_eq!(error.exit_code, 2, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn one_shot_commands_preserve_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let argument = OsString::from_vec(vec![0xff]);
+        let mut argv = args(&["tack", "--use", "cluster", "--", "kubectl"]);
+        argv.push(argument.clone());
+        let (_, result) = parse(argv);
+        let Invocation::Run(opts) = result.unwrap() else {
+            panic!("expected command invocation");
+        };
+        assert_eq!(opts.command[1], argument);
+    }
+
+    #[test]
+    fn one_shot_execution_sets_context_environment_and_keeps_arguments_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let kubeconfig = dir.path().join("cluster.yml");
+        let output = dir.path().join("output");
+        let mut command = args(&[
+            "/bin/sh",
+            "-c",
+            "printf '%s\\n' \"$KUBECONFIG\" \"$TACK_CONTEXT\" \"$TACK_ENABLED\" \"$2\" > \"$1\"",
+            "sh",
+        ]);
+        command.push(output.as_os_str().to_owned());
+        command.push("$(echo unexpected); --json".into());
+        run_command(&kubeconfig, "cluster", &command).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            format!(
+                "{}\ncluster\n1\n$(echo unexpected); --json\n",
+                kubeconfig.display()
+            )
+        );
+    }
+
+    #[test]
+    fn one_shot_execution_reports_start_errors_and_propagates_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let kubeconfig = dir.path().join("cluster.yml");
+        let missing = dir.path().join("missing-command");
+        let error = run_command(&kubeconfig, "cluster", &[missing.into_os_string()]).unwrap_err();
+        assert_eq!(error.code, "command_not_found");
+        let error =
+            run_command(&kubeconfig, "cluster", &args(&["/bin/sh", "-c", "exit 42"])).unwrap_err();
+        assert_eq!(error.code, "command_failed");
+        assert_eq!(error.exit_code, 42);
+        assert_eq!(error.json()["status"], 42);
     }
 
     #[test]

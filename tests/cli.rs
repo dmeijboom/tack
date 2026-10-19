@@ -110,7 +110,7 @@ fn malformed_toml_has_a_diagnostic_and_a_machine_readable_span() {
 }
 
 #[test]
-fn json_auth_required_never_starts_login_or_a_shell() {
+fn noninteractive_auth_required_never_starts_login_a_shell_or_a_command() {
     let home = TempDir::new().unwrap();
     configure(
         home.path(),
@@ -146,29 +146,39 @@ users:
     )
     .unwrap();
     fs::set_permissions(&fake_gcloud, fs::Permissions::from_mode(0o700)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_tack"))
-        .args(["--json", "use", "gke"])
-        .env("HOME", home.path())
-        .env("PATH", home.path())
-        .env("SHELL", &fake_gcloud)
-        .env("TACK_TEST_MARKER", &marker)
-        .output()
-        .unwrap();
-    let value = json(&output);
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(value["error"]["code"], "auth_required");
-    assert_eq!(value["error"]["command"]["program"], "gcloud");
-    assert_eq!(
-        value["error"]["command"]["args"],
-        serde_json::json!([
-            "auth",
-            "login",
-            "--force",
-            "--project",
-            "project",
-            "--account",
-            "user@example.com"
-        ])
-    );
-    assert!(!marker.exists());
+    for args in [
+        vec!["--json", "use", "gke"],
+        vec!["--use", "gke", "--", "gcloud"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tack"))
+            .args(&args)
+            .env("HOME", home.path())
+            .env("PATH", home.path())
+            .env("SHELL", &fake_gcloud)
+            .env("TACK_TEST_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        if args[0] == "--json" {
+            let value = json(&output);
+            assert_eq!(value["error"]["code"], "auth_required");
+            assert_eq!(value["error"]["command"]["program"], "gcloud");
+            assert_eq!(
+                value["error"]["command"]["args"],
+                serde_json::json!([
+                    "auth",
+                    "login",
+                    "--force",
+                    "--project",
+                    "project",
+                    "--account",
+                    "user@example.com"
+                ])
+            );
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("tack::auth_required"));
+        }
+        assert!(!marker.exists());
+    }
 }
