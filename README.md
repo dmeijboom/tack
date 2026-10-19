@@ -91,6 +91,14 @@ An `environment` result contains `context`, `namespace`, `kubeconfig`, `env`, an
 
 For namespace selection, `cleanup` lists the private temporary kubeconfig to delete when finished. JSON mode retains this file after tack exits and does not modify the input kubeconfig's namespace. Cached context kubeconfigs have an empty cleanup list and should not be deleted.
 
+## Agent Skill
+
+The portable [`tack` skill](.agents/skills/tack/SKILL.md) lets agents list contexts, activate a context or namespace using JSON environment overrides, and inspect Kubernetes with a strict read-only kubectl policy. It never uses interactive subshells or changes the global kubeconfig.
+
+Pi discovers it from `.agents/skills/tack/` in this repository; run `/reload` in an existing session, then use `/skill:tack`. To use it from other projects, copy that directory into your agent's user skills directory (for Pi, `~/.pi/agent/skills/tack/`). The skill requires the installed `tack` and `kubectl` executables, configured contexts, and any necessary cloud authentication.
+
+The skill prohibits Kubernetes writes, container execution, port forwarding, plugins, raw API requests, and credential overrides. This is an agent policy, **not an enforcement boundary**: use Kubernetes RBAC with read-only credentials to enforce resource and namespace restrictions. Activation can still refresh local kubeconfigs and credential caches and perform tack's non-persisted authentication review.
+
 ## Configuration
 
 Configuration lives at `~/.config/tack/config.toml`. Generated kubeconfigs are stored as YAML files in `~/.config/tack/`.
