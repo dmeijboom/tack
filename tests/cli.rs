@@ -110,6 +110,20 @@ fn malformed_toml_has_a_diagnostic_and_a_machine_readable_span() {
 }
 
 #[test]
+fn read_only_guard_rejects_commands_before_loading_configuration() {
+    let home = TempDir::new().unwrap();
+    for args in [
+        vec!["--use", "gke", "--", "kubectl", "delete", "pods", "--all"],
+        vec!["--use", "gke", "--", "gcloud"],
+    ] {
+        let output = cli(home.path(), &args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("tack::read_only_violation"));
+    }
+}
+
+#[test]
 fn noninteractive_auth_required_never_starts_login_a_shell_or_a_command() {
     let home = TempDir::new().unwrap();
     configure(
@@ -148,7 +162,7 @@ users:
     fs::set_permissions(&fake_gcloud, fs::Permissions::from_mode(0o700)).unwrap();
     for args in [
         vec!["--json", "use", "gke"],
-        vec!["--use", "gke", "--", "gcloud"],
+        vec!["--allow-write", "--use", "gke", "--", "gcloud"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_tack"))
             .args(&args)

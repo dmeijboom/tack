@@ -18,6 +18,7 @@ use crate::{
     recovery::Recovery,
 };
 
+mod access;
 mod config;
 mod error;
 mod output;
@@ -46,6 +47,12 @@ struct Opts {
         help = "Run a command in an isolated context without prompts or a shell"
     )]
     use_context: Option<String>,
+    #[arg(
+        long,
+        requires = "use_context",
+        help = "Allow unrestricted one-shot commands instead of read-only kubectl diagnostics"
+    )]
+    allow_write: bool,
     #[arg(
         last = true,
         required = true,
@@ -90,15 +97,23 @@ fn parse(args: Vec<OsString>) -> (Mode, Result<Invocation>) {
     let result = match command.try_get_matches_from(args) {
         Ok(matches) => Opts::from_arg_matches(&matches)
             .and_then(|opts| {
-                if opts.cmd.is_some() && (opts.use_context.is_some() || !opts.command.is_empty()) {
+                if opts.cmd.is_some()
+                    && (opts.use_context.is_some() || opts.allow_write || !opts.command.is_empty())
+                {
                     return Err(clap::Error::raw(
                         ErrorKind::ArgumentConflict,
-                        "--use and COMMAND cannot be combined with a subcommand",
+                        "--use, --allow-write and COMMAND cannot be combined with a subcommand",
                     ));
                 }
-                Ok(Invocation::Run(opts))
+                Ok(opts)
             })
-            .map_err(output::invalid_arguments),
+            .map_err(output::invalid_arguments)
+            .and_then(|opts| {
+                if opts.use_context.is_some() && !opts.allow_write {
+                    access::validate_read_only(&opts.command)?;
+                }
+                Ok(Invocation::Run(opts))
+            }),
         Err(error) => match error.kind() {
             ErrorKind::DisplayHelp => Ok(Invocation::Display(Data::Help {
                 text: error.to_string(),
@@ -545,6 +560,7 @@ mod tests {
     fn one_shot_commands_preserve_arguments_after_separator() {
         let (mode, result) = parse(args(&[
             "tack",
+            "--allow-write",
             "--use",
             "cluster",
             "--",
@@ -587,6 +603,9 @@ mod tests {
             vec!["tack", "--json", "--use", "cluster", "--", "kubectl"],
             vec!["tack", "--use", "cluster", "list"],
             vec!["tack", "--use", "cluster", "use", "other"],
+            vec!["tack", "--allow-write", "list"],
+            vec!["tack", "--allow-write", "use", "cluster"],
+            vec!["tack", "--allow-write", "--use", "cluster"],
         ] {
             let (_, result) = parse(args(&argv));
             let error = result.err().unwrap();
@@ -600,13 +619,70 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let argument = OsString::from_vec(vec![0xff]);
-        let mut argv = args(&["tack", "--use", "cluster", "--", "kubectl"]);
+        let mut argv = args(&["tack", "--allow-write", "--use", "cluster", "--", "kubectl"]);
         argv.push(argument.clone());
         let (_, result) = parse(argv);
         let Invocation::Run(opts) = result.unwrap() else {
             panic!("expected command invocation");
         };
         assert_eq!(opts.command[1], argument);
+    }
+
+    #[test]
+    fn one_shot_commands_are_read_only_unless_writes_are_allowed() {
+        for command in [
+            vec!["kubectl", "delete", "pods", "--all"],
+            vec!["kubectl", "exec", "app", "--", "sh"],
+            vec!["kubectl", "attach", "app"],
+            vec!["kubectl", "debug", "app", "--image=busybox"],
+            vec!["kubectl", "run", "app", "--image=nginx"],
+            vec!["kubectl", "cp", "app:/tmp/log", "./log"],
+            vec!["kubectl", "edit", "deployment", "app"],
+            vec!["kubectl", "create", "token", "app"],
+            vec!["helm", "upgrade", "app", "./chart"],
+            vec!["/bin/sh", "-c", "exit 0"],
+        ] {
+            let mut argv = args(&["tack", "--use", "cluster", "--"]);
+            argv.extend(args(&command));
+            let (_, result) = parse(argv);
+            assert_eq!(result.err().unwrap().code, "read_only_violation");
+
+            let mut argv = args(&["tack", "--allow-write", "--use", "cluster", "--"]);
+            argv.extend(args(&command));
+            let (_, result) = parse(argv);
+            assert!(matches!(
+                result.unwrap(),
+                Invocation::Run(Opts {
+                    allow_write: true,
+                    ..
+                })
+            ));
+        }
+        let (_, result) = parse(args(&[
+            "tack", "--use", "cluster", "--", "kubectl", "get", "pods",
+        ]));
+        assert!(matches!(
+            result.unwrap(),
+            Invocation::Run(Opts {
+                allow_write: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn child_allow_write_argument_does_not_disable_read_only_mode() {
+        let (_, result) = parse(args(&[
+            "tack",
+            "--use",
+            "cluster",
+            "--",
+            "kubectl",
+            "delete",
+            "pods",
+            "--allow-write",
+        ]));
+        assert_eq!(result.err().unwrap().code, "read_only_violation");
     }
 
     #[test]

@@ -28,8 +28,11 @@ tack list    # or: tack ls
 tack use             # interactive fuzzy picker
 tack use my-cluster  # directly by name
 
-# Run one command in a context without opening a shell or prompting for login
+# Run a read-only diagnostic without opening a shell or prompting for login
 tack --use my-cluster -- kubectl get pods --namespace kube-system
+
+# Explicitly allow a command that can write
+tack --allow-write --use my-cluster -- kubectl scale deployment app --replicas 2 --namespace default
 
 # Switch namespace within a context
 tack namespace          # or: tack ns (interactive fuzzy picker)
@@ -44,7 +47,13 @@ Exit status is `0` on success, `1` for runtime failures, `2` for invalid argumen
 
 ## One-shot commands
 
-`tack --use <context> -- <command> [args...]` validates access and runs the command directly with isolated `KUBECONFIG`, `TACK_CONTEXT`, and `TACK_ENABLED` overrides. The `--` separator and a command are required. Arguments after `--` are passed unchanged, without shell evaluation; stdout and stderr are inherited.
+`tack --use <context> -- <command> [args...]` defaults to read-only kubectl diagnostics. Before configuration loading or activation, tack rejects commands outside its allowlist with `read_only_violation`. Allowed verbs are `get`, `describe`, `logs`, `top pods`, `top nodes`, `api-resources`, `api-versions`, `version`, `port-forward`, and `proxy`. Secret reads are permitted like reads of other resources. Only the literal executable name `kubectl` is accepted; the verb must come first, before options. Each verb has a limited option allowlist: common namespace, selector, output, and bounded-log options are supported where applicable. Use separate option values or `--option=value`; combined short flags are not supported. Unknown options, raw API requests, context/credential overrides, plugins, and shells are rejected.
+
+Add `--allow-write` before `--` to disable this guard and permit unrestricted one-shot command execution, including non-kubectl commands. This changes the previous unrestricted default. The flag requires `--use` and a command; it does not apply to interactive subshells. Tack does not ask for approval itself; the agent skill requires explicit user approval before using this flag.
+
+After command validation, tack validates access and runs the command directly with isolated `KUBECONFIG`, `TACK_CONTEXT`, and `TACK_ENABLED` overrides. The `--` separator and a command are required. Arguments after `--` are passed unchanged, without shell evaluation; stdout and stderr are inherited.
+
+The guard is not a security sandbox: it trusts the `kubectl` executable on PATH and existing authentication configuration, does not restrict resource visibility or downstream requests through port forwarding/proxying, and does not reduce credential permissions. Use Kubernetes RBAC for enforcement. Interactive shells and commands run outside tack are not guarded.
 
 Activation is non-interactive, using the same checks and credential recovery as JSON mode. If cloud login is needed, tack reports the error without launching login or the command. Authenticate in a terminal and retry. The child command runs once and is not intercepted or retried. This mode cannot be combined with `--json` or a tack subcommand.
 
@@ -102,11 +111,11 @@ For namespace selection, `cleanup` lists the private temporary kubeconfig to del
 
 ## Agent Skill
 
-The portable [`tack` skill](.agents/skills/tack/SKILL.md) lets agents validate a context once with `tack --json use <context>`, then inspect Kubernetes through `tack --use <context> -- kubectl ...` with a strict read-only policy. Namespaces are selected with kubectl's `--namespace` flag. Every command explicitly selects its tack context. It never uses interactive subshells or changes the global kubeconfig.
+The portable [`tack` skill](.agents/skills/tack/SKILL.md) lets agents validate a context once with `tack --json use <context>`, then access Kubernetes through `tack --use <context> -- kubectl ...`. It starts in **Read Only**, using tack's default command guard. **Read/Write** requires explicit user approval of a task-scoped plan naming the context, namespaces or cluster scope, resources, commands, and intended changes; approved writes add `--allow-write`. Scope changes require fresh approval, and approval expires when the task completes, the context changes, or the user revokes it. Namespaces are selected with kubectl's `--namespace` flag. Every command explicitly selects its tack context. It never uses interactive subshells or changes the global kubeconfig.
 
 Pi discovers it from `.agents/skills/tack/` in this repository; run `/reload` in an existing session, then use `/skill:tack`. To use it from other projects, copy that directory into your agent's user skills directory (for Pi, `~/.pi/agent/skills/tack/`). The skill requires the installed `tack` and `kubectl` executables, configured contexts, and any necessary cloud authentication.
 
-The skill permits non-mutating kubectl diagnostics, including loopback-only port forwarding and proxying for read-only access. It prohibits Kubernetes and application writes, container execution, plugins, raw kubectl API requests, and credential overrides. This is an agent policy, **not an enforcement boundary**: use Kubernetes RBAC with read-only credentials to enforce resource and namespace restrictions. Activation can still refresh local kubeconfigs and credential caches and perform tack's non-persisted authentication review.
+The skill permits kubectl diagnostics, Secret reads, port forwarding, and proxying in both modes, and planned Kubernetes mutations only in approved Read/Write mode. Forwarded/proxied connections must be used for non-mutating requests in Read Only. Read/Write also permits approved container operations (`exec`, `attach`, `debug`, `run`, `cp`), interactive edits, RBAC/Secret changes, token creation, plugins, Helm, scripts, and raw API requests. The Read Only allowlist does not limit approved Read/Write operations; all operations must stay within the selected context and approved task. Approval is agent policy, **not an enforcement boundary**: `--allow-write` disables the CLI guard without checking the plan. Use Kubernetes RBAC to enforce resource, namespace, and verb restrictions. Activation can still refresh local kubeconfigs and credential caches and perform tack's non-persisted authentication review.
 
 ## Configuration
 
