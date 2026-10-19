@@ -34,11 +34,14 @@ pub enum Generator {
     Gcloud {
         project: String,
         location: String,
+        account: Option<String>,
+        configuration: Option<String>,
     },
     Aks {
         subscription: String,
         #[serde(rename = "resource-group")]
         resource_group: String,
+        tenant: Option<String>,
     },
     Tcloud {
         organisation: String,
@@ -60,4 +63,38 @@ pub fn load_default_config() -> Result<Config, ConfigError> {
     }
 
     Err(ConfigError::Missing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_settings_are_optional() {
+        let config: Config = toml::from_str(
+            r#"
+            [context.gke]
+            generator = "gcloud"
+            project = "project"
+            location = "location"
+            [context.aks]
+            generator = "aks"
+            subscription = "subscription"
+            resource-group = "group"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.context["gke"].generator,
+            Some(Generator::Gcloud {
+                account: None,
+                configuration: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            config.context["aks"].generator,
+            Some(Generator::Aks { tenant: None, .. })
+        ));
+    }
 }
