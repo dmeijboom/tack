@@ -35,7 +35,7 @@ struct Opts {
     #[arg(
         long,
         global = true,
-        help = "Emit one JSON result without prompts or shells"
+        help = "Emit one JSON result without pickers or shells; device-code prompts use stderr"
     )]
     json: bool,
     #[arg(
@@ -370,7 +370,8 @@ async fn run(opts: Opts) -> Result<Data> {
                 ctx.generator.as_ref(),
                 &kubeconfig,
                 mode,
-            );
+            )
+            .with_device_login(opts.command.is_empty());
             if !store.contains(&name) {
                 if ctx.generator.is_none() {
                     return Err(AppError::new(

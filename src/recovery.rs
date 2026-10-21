@@ -66,6 +66,7 @@ fn prepare_client_config(
     config: &mut Kubeconfig,
     generator: Option<&Generator>,
     mode: Mode,
+    device_login: bool,
 ) -> AzureLogin {
     let mut azure = AzureLogin::default();
     if !mode.is_json()
@@ -89,15 +90,28 @@ fn prepare_client_config(
         .and_then(|auth| auth.auth_info.as_mut())
         .and_then(|auth| auth.exec.as_mut())
     {
-        // kube-rs inherits stderr for interactive plugins, hiding login failures from recovery.
-        exec.interactive_mode = Some(ExecInteractiveMode::Never);
-        if matches!(generator, Some(Generator::Aks { .. })) {
-            let args = exec
-                .args
-                .iter()
-                .flatten()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
+        let args = exec
+            .args
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let is_azure = matches!(generator, Some(Generator::Aks { .. }));
+        let login = argument_value(&args, "--login").or_else(|| argument_value(&args, "-l"));
+        let device_code = is_azure && matches!(login.as_deref(), None | Some("devicecode"));
+        let interactive_login =
+            device_code || (is_azure && login.as_deref() == Some("interactive"));
+        // kube-rs captures stderr in Never mode, which hides device codes until login times out.
+        if mode.is_json() {
+            exec.interactive_mode = Some(if device_login && device_code {
+                ExecInteractiveMode::IfAvailable
+            } else {
+                ExecInteractiveMode::Never
+            });
+        } else if !interactive_login {
+            exec.interactive_mode = Some(ExecInteractiveMode::Never);
+        }
+        if is_azure {
             azure.tenant = argument_value(&args, "--tenant-id");
             azure.scope = argument_value(&args, "--server-id")
                 .map(|server| format!("{}/.default", server.trim_end_matches('/')));
@@ -115,6 +129,7 @@ pub struct Recovery<'a> {
     logged_in: bool,
     azure_login: AzureLogin,
     mode: Mode,
+    device_login: bool,
 }
 
 impl<'a> Recovery<'a> {
@@ -134,7 +149,13 @@ impl<'a> Recovery<'a> {
             logged_in: false,
             azure_login: AzureLogin::default(),
             mode,
+            device_login: true,
         }
+    }
+
+    pub fn with_device_login(mut self, enabled: bool) -> Self {
+        self.device_login = enabled;
+        self
     }
 
     fn action(&mut self, error: &(dyn Error + 'static)) -> Option<Action> {
@@ -329,8 +350,12 @@ impl<'a> Recovery<'a> {
             let result = async {
                 let mut kubeconfig = Kubeconfig::read_from(self.kubeconfig)
                     .map_err(|source| AppError::kubeconfig(self.kubeconfig, source))?;
-                self.azure_login =
-                    prepare_client_config(&mut kubeconfig, self.generator, self.mode);
+                self.azure_login = prepare_client_config(
+                    &mut kubeconfig,
+                    self.generator,
+                    self.mode,
+                    self.device_login,
+                );
                 let config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
                     .await
                     .map_err(|source| AppError::kubeconfig(self.kubeconfig, source))?;
@@ -627,7 +652,7 @@ users:
     fn cloud_checks_capture_stderr_without_changing_stored_exec_settings() {
         let original = azure_kubeconfig();
         let mut prepared = original.clone();
-        let settings = prepare_client_config(&mut prepared, Some(&aks()), Mode::Human);
+        let settings = prepare_client_config(&mut prepared, Some(&aks()), Mode::Human, true);
         assert_eq!(settings.tenant.as_deref(), Some("kube-tenant"));
         assert_eq!(settings.scope.as_deref(), Some("kube-server/.default"));
         assert_eq!(
@@ -653,11 +678,65 @@ users:
             Some(ExecInteractiveMode::IfAvailable)
         );
         let mut unmanaged = original.clone();
-        prepare_client_config(&mut unmanaged, None, Mode::Human);
+        prepare_client_config(&mut unmanaged, None, Mode::Human, true);
         assert_eq!(
             serde_yaml::to_string(&unmanaged).unwrap(),
             serde_yaml::to_string(&original).unwrap()
         );
+    }
+
+    #[test]
+    fn azure_login_prompts_respect_output_and_activation_modes() {
+        for login in [
+            vec![],
+            vec!["--login", "devicecode"],
+            vec!["-l", "devicecode"],
+            vec!["--login=devicecode"],
+            vec!["-l=devicecode"],
+            vec!["--login", "interactive"],
+        ] {
+            for (mode, device_login) in
+                [(Mode::Human, true), (Mode::Json, true), (Mode::Json, false)]
+            {
+                let mut config = azure_kubeconfig();
+                let exec = config.auth_infos[0]
+                    .auth_info
+                    .as_mut()
+                    .unwrap()
+                    .exec
+                    .as_mut()
+                    .unwrap();
+                exec.args = Some(
+                    std::iter::once("get-token")
+                        .chain(login.iter().copied())
+                        .map(String::from)
+                        .collect(),
+                );
+                let original = serde_yaml::to_string(&config).unwrap();
+                prepare_client_config(&mut config, Some(&aks()), mode, device_login);
+                let exec = config.auth_infos[0]
+                    .auth_info
+                    .as_ref()
+                    .unwrap()
+                    .exec
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    exec.interactive_mode,
+                    Some(
+                        if mode.is_json() && (!device_login || login.contains(&"interactive")) {
+                            ExecInteractiveMode::Never
+                        } else {
+                            ExecInteractiveMode::IfAvailable
+                        }
+                    ),
+                    "{login:?} {mode:?} device_login={device_login}"
+                );
+                if !mode.is_json() {
+                    assert_eq!(serde_yaml::to_string(&config).unwrap(), original);
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -667,7 +746,7 @@ users:
             *tenant = None;
         }
         let mut kubeconfig = azure_kubeconfig();
-        let settings = prepare_client_config(&mut kubeconfig, Some(&generator), Mode::Human);
+        let settings = prepare_client_config(&mut kubeconfig, Some(&generator), Mode::Human, true);
         let exec = kubeconfig.auth_infos[0]
             .auth_info
             .as_mut()
@@ -966,7 +1045,7 @@ users:
     #[test]
     fn json_checks_make_unmanaged_exec_plugins_noninteractive() {
         let mut config = azure_kubeconfig();
-        prepare_client_config(&mut config, None, Mode::Json);
+        prepare_client_config(&mut config, None, Mode::Json, true);
         assert_eq!(
             config.auth_infos[0]
                 .auth_info
